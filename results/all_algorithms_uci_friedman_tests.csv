@@ -1,0 +1,7 @@
+metric,higher_is_better,block_unit,n_blocks,n_methods,statistic,p_value,significant_alpha_0_05
+pc,True,dataset_mean_over_seeds,8,6,34.571428571428555,1.8319770095529549e-06,True
+pe,False,dataset_mean_over_seeds,8,6,33.714285714285694,2.714059348470693e-06,True
+sil,True,dataset_mean_over_seeds,8,6,11.125461254612542,0.048948424309733375,True
+pur,True,dataset_mean_over_seeds,8,6,29.342105263157897,1.9865694167144804e-05,True
+nmi,True,dataset_mean_over_seeds,8,6,21.789667896678946,0.0005740587068192181,True
+ari,True,dataset_mean_over_seeds,8,6,23.118081180811807,0.00032046309582520855,True

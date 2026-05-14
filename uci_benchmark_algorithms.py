@@ -1,18 +1,31 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
 from time import perf_counter
 from urllib.request import urlretrieve
 
 import numpy as np
 import pandas as pd
+from scipy.stats import friedmanchisquare, studentized_range
 
 
 EPS = np.finfo(np.float64).eps
 DEFAULT_RANDOM_STATE = 42
 DEFAULT_MAX_ITER = 5000
 DEFAULT_TOL = 1e-5
+DEFAULT_N_SEEDS = 30
+STATISTICAL_TEST_ALPHA = 0.05
+BENCHMARK_METRICS = ("pc", "pe", "sil", "pur", "nmi", "ari")
+METRIC_DIRECTIONS = {
+    "pc": True,
+    "pe": False,
+    "sil": True,
+    "pur": True,
+    "nmi": True,
+    "ari": True,
+}
 
 
 def standardize(X):
@@ -202,6 +215,171 @@ def evaluate_memberships(X, y_true, U):
         "nmi": normalized_mutual_info(y_true, labels),
         "ari": adjusted_rand_index(y_true, labels),
     }
+
+
+def sample_std(series):
+    series = pd.Series(series, dtype=np.float64).dropna()
+    if series.size <= 1:
+        return 0.0
+    return float(series.std(ddof=1))
+
+
+def mean_std_text(mean, std, precision=4):
+    if pd.isna(mean):
+        return ""
+    std = 0.0 if pd.isna(std) else float(std)
+    return f"{float(mean):.{precision}f} ± {std:.{precision}f}"
+
+
+def summarize_repeated_runs(all_runs_df):
+    group_cols = ["dataset", "samples", "features", "classes", "method"]
+    value_cols = [
+        "objective",
+        "pc",
+        "pe",
+        "sil",
+        "pur",
+        "nmi",
+        "ari",
+        "iterations",
+        "total_time_s",
+    ]
+    value_cols = [col for col in value_cols if col in all_runs_df.columns]
+
+    aggregations = {
+        "n_seeds": ("seed", "nunique"),
+        "seed_min": ("seed", "min"),
+        "seed_max": ("seed", "max"),
+        "converged_runs": ("converged", "sum"),
+    }
+    for col in value_cols:
+        aggregations[f"{col}_mean"] = (col, "mean")
+        aggregations[f"{col}_std"] = (col, sample_std)
+
+    summary = (
+        all_runs_df
+        .groupby(group_cols, dropna=False)
+        .agg(**aggregations)
+        .reset_index()
+    )
+
+    for col in value_cols:
+        summary[f"{col}_mean_std"] = [
+            mean_std_text(mean, std)
+            for mean, std in zip(summary[f"{col}_mean"], summary[f"{col}_std"])
+        ]
+
+    formatted_cols = [f"{col}_mean_std" for col in value_cols]
+    numeric_cols = []
+    for col in value_cols:
+        numeric_cols.extend([f"{col}_mean", f"{col}_std"])
+
+    return summary[
+        group_cols
+        + ["n_seeds", "seed_min", "seed_max", "converged_runs"]
+        + formatted_cols
+        + numeric_cols
+    ]
+
+
+def metric_blocks(all_runs_df, metric, methods):
+    dataset_method_means = (
+        all_runs_df
+        .groupby(["dataset", "method"], dropna=False)[metric]
+        .mean()
+        .reset_index()
+    )
+    blocks = dataset_method_means.pivot_table(
+        index="dataset",
+        columns="method",
+        values=metric,
+        aggfunc="mean",
+    )
+    return blocks.reindex(columns=list(methods)).dropna()
+
+
+def ranked_metric_blocks(all_runs_df, metric, methods):
+    higher_is_better = METRIC_DIRECTIONS[metric]
+    blocks = metric_blocks(all_runs_df, metric, methods)
+    ranks = blocks.rank(axis=1, ascending=not higher_is_better, method="average")
+    return blocks, ranks
+
+
+def friedman_nemenyi_tests(all_runs_df, methods, metrics=BENCHMARK_METRICS, alpha=STATISTICAL_TEST_ALPHA):
+    friedman_rows = []
+    rank_rows = []
+    nemenyi_rows = []
+
+    for metric in metrics:
+        blocks, ranks = ranked_metric_blocks(all_runs_df, metric, methods)
+        n_blocks = int(blocks.shape[0])
+        n_methods = int(blocks.shape[1])
+        if n_blocks == 0 or n_methods < 2:
+            continue
+
+        values = blocks.to_numpy(dtype=np.float64)
+        if np.all(np.nanmax(values, axis=1) - np.nanmin(values, axis=1) <= EPS):
+            statistic = 0.0
+            p_value = 1.0
+        else:
+            statistic, p_value = friedmanchisquare(
+                *[blocks[method].to_numpy(dtype=np.float64) for method in blocks.columns]
+            )
+            statistic = float(statistic)
+            p_value = float(p_value)
+
+        friedman_rows.append({
+            "metric": metric,
+            "higher_is_better": METRIC_DIRECTIONS[metric],
+            "block_unit": "dataset_mean_over_seeds",
+            "n_blocks": n_blocks,
+            "n_methods": n_methods,
+            "statistic": statistic,
+            "p_value": p_value,
+            "significant_alpha_0_05": bool(p_value < alpha),
+        })
+
+        mean_ranks = ranks.mean(axis=0)
+        for method, mean_rank in mean_ranks.items():
+            rank_rows.append({
+                "metric": metric,
+                "method": method,
+                "block_unit": "dataset_mean_over_seeds",
+                "mean_rank": float(mean_rank),
+                "n_blocks": n_blocks,
+            })
+
+        rank_standard_error = np.sqrt(n_methods * (n_methods + 1) / (6.0 * n_blocks))
+        critical_distance = (
+            studentized_range.ppf(1.0 - alpha, n_methods, np.inf)
+            / np.sqrt(2.0)
+            * rank_standard_error
+        )
+
+        for method_a, method_b in combinations(blocks.columns, 2):
+            rank_a = float(mean_ranks[method_a])
+            rank_b = float(mean_ranks[method_b])
+            rank_diff = abs(rank_a - rank_b)
+            q_statistic = rank_diff / rank_standard_error
+            p_value = float(studentized_range.sf(q_statistic * np.sqrt(2.0), n_methods, np.inf))
+            nemenyi_rows.append({
+                "metric": metric,
+                "method_a": method_a,
+                "method_b": method_b,
+                "block_unit": "dataset_mean_over_seeds",
+                "mean_rank_a": rank_a,
+                "mean_rank_b": rank_b,
+                "rank_diff": rank_diff,
+                "critical_distance_alpha_0_05": float(critical_distance),
+                "q_statistic": float(q_statistic),
+                "p_value": min(max(p_value, 0.0), 1.0),
+                "significant_alpha_0_05": bool(rank_diff > critical_distance),
+            })
+
+    friedman_df = pd.DataFrame(friedman_rows)
+    rank_df = pd.DataFrame(rank_rows)
+    nemenyi_df = pd.DataFrame(nemenyi_rows)
+    return friedman_df, rank_df, nemenyi_df
 
 
 @dataclass
@@ -770,13 +948,13 @@ def run_single_method(dataset, method, seed, max_iter=DEFAULT_MAX_ITER, tol=DEFA
 def benchmark_all_methods(
     datasets,
     methods=("FCM", "PCM", "PFCM", "DPC-FCM", "eFCM", "DA-FCM"),
-    n_init=5,
+    n_init=DEFAULT_N_SEEDS,
     random_state=DEFAULT_RANDOM_STATE,
     max_iter=DEFAULT_MAX_ITER,
     tol=DEFAULT_TOL,
+    alpha=STATISTICAL_TEST_ALPHA,
 ):
     all_rows = []
-    summary_rows = []
 
     for dataset in datasets:
         for method in methods:
@@ -788,18 +966,21 @@ def benchmark_all_methods(
                 run_rows.append(row)
                 all_rows.append(row)
 
-            objectives = np.array([row["objective"] for row in run_rows], dtype=np.float64)
-            stable_init_order = np.arange(len(run_rows))
-            best_idx = int(np.lexsort((stable_init_order, np.nan_to_num(objectives, nan=np.inf)))[0])
-            best = run_rows[best_idx].copy()
-            best["n_init"] = n_init
-            best["best_seed"] = best["seed"]
-            summary_rows.append(best)
-
+            pc_values = np.array([row["pc"] for row in run_rows], dtype=np.float64)
+            pe_values = np.array([row["pe"] for row in run_rows], dtype=np.float64)
             print(
                 f"{dataset['name']} | {method}: "
-                f"PC={best['pc']:.4f}, PE={best['pe']:.4f}, "
-                f"Iter={best['iterations']}, Time={best['total_time_s'] * 1000:.1f} ms"
+                f"PC={pc_values.mean():.4f} ± {sample_std(pc_values):.4f}, "
+                f"PE={pe_values.mean():.4f} ± {sample_std(pe_values):.4f}, "
+                f"Seeds={n_init}"
             )
 
-    return pd.DataFrame(summary_rows), pd.DataFrame(all_rows)
+    all_runs_df = pd.DataFrame(all_rows)
+    summary_df = summarize_repeated_runs(all_runs_df)
+    friedman_df, rank_df, nemenyi_df = friedman_nemenyi_tests(
+        all_runs_df,
+        methods=methods,
+        metrics=BENCHMARK_METRICS,
+        alpha=alpha,
+    )
+    return summary_df, all_runs_df, friedman_df, rank_df, nemenyi_df
